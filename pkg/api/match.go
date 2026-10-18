@@ -72,6 +72,7 @@ type Match struct {
 	PlayersBuy                []*PlayerBuy                `json:"playersBuy"`
 	PlayerEconomies           []*PlayerEconomy            `json:"playerEconomies"`
 	ChatMessages              []*ChatMessage              `json:"chatMessages"`
+	Coaches                   []*Coach                    `json:"coaches"`
 	scoreTeamA                *int
 	scoreTeamB                *int
 }
@@ -83,12 +84,16 @@ type MatchJSON struct {
 	GameModeStr string `json:"gameModeStr"`
 }
 
-func (match *Match) MarshalJSON() ([]byte, error) {
-
-	return json.Marshal(MatchJSON{
+// toJSON returns the value the match is marshalled as.
+func (match *Match) toJSON() MatchJSON {
+	return MatchJSON{
 		MatchAlias:  (*MatchAlias)(match),
 		GameModeStr: match.GameModeStr().String(),
-	})
+	}
+}
+
+func (match *Match) MarshalJSON() ([]byte, error) {
+	return json.Marshal(match.toJSON())
 }
 
 func (match Match) GameModeStr() constants.GameModeStr {
@@ -316,6 +321,7 @@ func newMatch(source constants.DemoSource, demoInfo *demo.Demo) Match {
 		HostagePositions:          []*HostagePosition{},
 		ChickenPositions:          []*ChickenPosition{},
 		ChatMessages:              []*ChatMessage{},
+		Coaches:                   []*Coach{},
 		ChickenDeaths:             []*ChickenDeath{},
 		GrenadeProjectilesDestroy: []*GrenadeProjectileDestroy{},
 	}
@@ -327,6 +333,7 @@ func newMatch(source constants.DemoSource, demoInfo *demo.Demo) Match {
 
 func (match *Match) reset() {
 	match.PlayersBySteamID = make(map[uint64]*Player)
+	match.Coaches = []*Coach{}
 	match.Rounds = []*Round{}
 	match.Kills = []*Kill{}
 	match.Clutches = []*Clutch{}

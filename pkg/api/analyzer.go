@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/akiver/cs-demo-analyzer/internal/converters"
@@ -59,6 +59,28 @@ type Analyzer struct {
 	// to detect which player is untying an hostage in case of consecutive events.
 	playersUntyingAnHostage map[uint64]int
 	chickenEntities         []st.Entity
+	// Cached 2D convex hull of each burning inferno's active fires, only used when positions are included.
+	infernoHulls map[common.UniqueID]*infernoHull
+	// Weapon lists of the last position created for each player, shared with the next positions while the
+	// inventory doesn't change, see internWeapons(). Only used when positions are included.
+	playerWeapons map[*common.Player]*playerWeapons
+	// Scratch lists newPlayerPosition() builds the current inventory into before comparing it with playerWeapons.
+	playerWeaponsScratch playerWeapons
+	// Scratch slice for sortedEntityIDs(), re-used across frames.
+	entityIDsScratch []int
+}
+
+// sortedEntityIDs returns the keys of a map of entities by entity ID in ascending order, to range over the map in a
+// deterministic order. The IDs are appended to scratch (emptied first) to avoid allocating on every call.
+func sortedEntityIDs[T any](scratch []int, entities map[int]T) []int {
+	ids := scratch[:0]
+	for id := range entities {
+		ids = append(ids, id)
+	}
+
+	slices.Sort(ids)
+
+	return ids
 }
 
 type AnalyzeDemoOptions struct {
@@ -91,6 +113,9 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 	parserConfig := dem.DefaultParserConfig
 	parserConfig.NetMessageDecryptionKey = demo.NetMessageDecryptionPublicKey
 	parserConfig.DisableMimicSource1Events = demo.Type == constants.DemoTypePOV
+	// Older CS2 demos don't network the players velocity, it's derived from their positions which must be tracked
+	// before the first Player.Velocity() call, otherwise it returns 0.
+	parserConfig.EagerVelocityTracking = true
 
 	parser := dem.NewParserWithConfig(file, parserConfig)
 	defer parser.Close()
@@ -120,6 +145,8 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 		buyTimeSeconds:            20, // Default mp_buytime value is 20
 		lastFreezeTimeEndTick:     -1,
 		bombPlantPosition:         r3.Vector{},
+		infernoHulls:              map[common.UniqueID]*infernoHull{},
+		playerWeapons:             map[*common.Player]*playerWeapons{},
 		lastGrenadeThrownByPlayer: make(map[uint64]*Shot),
 		playersUntyingAnHostage:   make(map[uint64]int),
 		postProcess:               defaultPostProcess,
@@ -304,41 +331,67 @@ func (analyzer *Analyzer) resetCurrentRound() {
 	analyzer.createPlayersEconomies()
 }
 
+// entityIntProperty returns the int value of the entity property with the given name.
+// It returns false when the property doesn't exist or has never been networked (Source 2 only).
+func entityIntProperty(entity st.Entity, name string) (int, bool) {
+	prop, exists := entity.PropertyValue(name)
+	if !exists || (prop.S2 && prop.Any == nil) {
+		return 0, false
+	}
+
+	return prop.Int(), true
+}
+
 func (analyzer *Analyzer) registerPlayer(player *common.Player, teamState *common.TeamState) {
 	match := analyzer.match
 	if _, alreadyExists := match.PlayersBySteamID[player.SteamID64]; alreadyExists {
 		return
 	}
 
-	if teamState == nil || player.SteamID64 == 0 {
-		return
-	}
-
-	if player.Entity == nil || (analyzer.isSource2 && player.PlayerPawnEntity() == nil) {
+	if player.SteamID64 == 0 || player.Entity == nil {
 		return
 	}
 
 	// Start of coach detection.
-	// Quick way to detect coaches for demos coming from providers such as PRACC that put coaches as a real player
-	// visible in the scoreboard and make them dead at the end of round freezetime.
-	// Coaches have an out-of-range color value (> 4), which never occurs for real players (valid range: 0-4).
-	if analyzer.isSource2 && player.Entity.PropertyValueMust("m_iCompTeammateColor").Int() > 4 {
-		return
+	// It happens before the team state and pawn checks because coaches may be in the spectators team (no team state)
+	// and without a pawn. Only controller properties are read here so it's safe.
+	if analyzer.isSource2 {
+		// Quick way to detect coaches for demos coming from providers such as PRACC that put coaches as a real player
+		// visible in the scoreboard and make them dead at the end of round freezetime.
+		// Coaches have an out-of-range color value (> 4), which never occurs for real players (valid range: 0-4).
+		if color, exists := entityIntProperty(player.Entity, "m_iCompTeammateColor"); exists && color > 4 {
+			side := common.TeamUnassigned
+			if teamState != nil {
+				side = teamState.Team()
+			}
+			analyzer.registerCoach(player, side)
+			return
+		}
 	}
 
-	if prop, exists := player.Entity.PropertyValue("m_iCoachingTeam"); exists {
-		coachTeam := prop.Int()
-		if coachTeam == int(common.TeamCounterTerrorists) || coachTeam == int(common.TeamTerrorists) {
+	if coachingTeam, exists := entityIntProperty(player.Entity, "m_iCoachingTeam"); exists {
+		side := common.Team(coachingTeam)
+		if side == common.TeamCounterTerrorists || side == common.TeamTerrorists {
+			analyzer.registerCoach(player, side)
 			return
 		}
 	}
 	// End of coach detection
+
+	if teamState == nil {
+		return
+	}
+
+	if analyzer.isSource2 && player.PlayerPawnEntity() == nil {
+		return
+	}
 
 	playerTeam := teamState.Team()
 	if playerTeam == common.TeamSpectators || playerTeam == common.TeamUnassigned {
 		return
 	}
 
+	analyzer.removeCoach(player.SteamID64)
 	newPlayer := NewPlayer(analyzer, playerTeam, *player)
 	match.PlayersBySteamID[player.SteamID64] = newPlayer
 }
@@ -627,7 +680,7 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 		}
 
 		currentRound := analyzer.currentRound
-		isDroppedWeapon := slice.Contains(currentRound.weaponsBoughtUniqueIds, event.Weapon.UniqueID2().String())
+		isDroppedWeapon := slice.Contains(currentRound.weaponsBoughtUniqueIds, event.Weapon.UniqueID().String())
 		if isDroppedWeapon {
 			return
 		}
@@ -637,7 +690,7 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 			return
 		}
 
-		currentRound.weaponsBoughtUniqueIds = append(currentRound.weaponsBoughtUniqueIds, event.Weapon.UniqueID2().String())
+		currentRound.weaponsBoughtUniqueIds = append(currentRound.weaponsBoughtUniqueIds, event.Weapon.UniqueID().String())
 		match.PlayersBuy = append(match.PlayersBuy, newPlayerBuy(analyzer, event))
 	})
 
@@ -672,31 +725,21 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 				match.ChickenPositions = append(match.ChickenPositions, chickenPosition)
 			}
 
-			// GrenadeProjectiles() and Infernos() are maps and Go randomizes map range
-			// order per process, so iterate them in sorted entity-ID order, otherwise the
-			// within-frame element order differs on every run and the exported JSON is
-			// not reproducible for identical input demos.
-			projectilesByID := parser.GameState().GrenadeProjectiles()
-			projectileIDs := make([]int, 0, len(projectilesByID))
-			for id := range projectilesByID {
-				projectileIDs = append(projectileIDs, id)
-			}
-			sort.Ints(projectileIDs)
-			for _, id := range projectileIDs {
-				position := newGrenadePositionFromProjectile(analyzer, projectilesByID[id])
+			// GrenadeProjectiles() and Infernos() are maps, ranging them yields a different order on every run.
+			// They are visited by entity ID so that the positions of a frame are always exported in the same order.
+			projectiles := parser.GameState().GrenadeProjectiles()
+			analyzer.entityIDsScratch = sortedEntityIDs(analyzer.entityIDsScratch, projectiles)
+			for _, entityID := range analyzer.entityIDsScratch {
+				position := newGrenadePositionFromProjectile(analyzer, projectiles[entityID])
 				if position != nil {
 					match.GrenadePositions = append(match.GrenadePositions, position)
 				}
 			}
 
-			infernosByID := parser.GameState().Infernos()
-			infernoIDs := make([]int, 0, len(infernosByID))
-			for id := range infernosByID {
-				infernoIDs = append(infernoIDs, id)
-			}
-			sort.Ints(infernoIDs)
-			for _, id := range infernoIDs {
-				infernoPosition := newInfernoPositionFromInferno(analyzer, infernosByID[id])
+			infernos := parser.GameState().Infernos()
+			analyzer.entityIDsScratch = sortedEntityIDs(analyzer.entityIDsScratch, infernos)
+			for _, entityID := range analyzer.entityIDsScratch {
+				infernoPosition := newInfernoPositionFromInferno(analyzer, infernos[entityID])
 				if infernoPosition != nil {
 					match.InfernoPositions = append(match.InfernoPositions, infernoPosition)
 				}
@@ -711,6 +754,10 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 				hostagePosition := newHostagePositionFromHostage(analyzer, hostage)
 				match.HostagePositions = append(match.HostagePositions, hostagePosition)
 			}
+		})
+
+		parser.RegisterEventHandler(func(event events.InfernoExpired) {
+			delete(analyzer.infernoHulls, event.Inferno.UniqueID())
 		})
 	}
 
@@ -958,7 +1005,7 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 		if lastGrenadeShotExist == nil {
 			fmt.Println("A projectile throw event occurred whereas its weapon fired event didn't occurred.")
 		} else {
-			lastGrenadeShotExist.ProjectileID = projectile.UniqueID()
+			lastGrenadeShotExist.ProjectileID = projectile.UniqueID().String()
 			delete(analyzer.lastGrenadeThrownByPlayer, thrower.SteamID64)
 		}
 	})
@@ -1012,6 +1059,17 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 		// The AnnouncementWinPanelMatch event is triggered before ScoreUpdated and we can't use the Kill event because
 		// the player's score at this point is the current player's score (before the kill).
 		analyzer.updatePlayersScores()
+	})
+
+	// Players may be renamed after they have been registered, e.g. CS2 names come from the player controller.
+	parser.RegisterEventHandler(func(event events.PlayerNameChange) {
+		if event.Player == nil {
+			return
+		}
+
+		if player, exist := match.PlayersBySteamID[event.Player.SteamID64]; exist {
+			player.Name = event.NewName
+		}
 	})
 
 	parser.RegisterEventHandler(func(event events.RankUpdate) {

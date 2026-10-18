@@ -381,7 +381,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(shot.RoundNumber),
 				shot.WeaponName.String(),
 				shot.WeaponID,
-				converters.Int64ToString(shot.ProjectileID),
+				shot.ProjectileID,
 				converters.Float64ToString(shot.X),
 				converters.Float64ToString(shot.Y),
 				converters.Float64ToString(shot.Z),
@@ -1047,7 +1047,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(position.Tick),
 				converters.IntToString(position.RoundNumber),
 				position.GrenadeID,
-				converters.Int64ToString(position.ProjectileID),
+				position.ProjectileID,
 				position.GrenadeName.String(),
 				converters.Float64ToString(position.X),
 				converters.Float64ToString(position.Y),
@@ -1099,7 +1099,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(position.Tick),
 				converters.IntToString(position.RoundNumber),
 				position.GrenadeID,
-				converters.Int64ToString(position.ProjectileID),
+				position.ProjectileID,
 				position.GrenadeName.String(),
 				converters.Float64ToString(position.X),
 				converters.Float64ToString(position.Y),
@@ -1151,7 +1151,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(event.Tick),
 				converters.IntToString(event.RoundNumber),
 				event.GrenadeID,
-				converters.Int64ToString(event.ProjectileID),
+				event.ProjectileID,
 				event.GrenadeName.String(),
 				converters.Float64ToString(event.X),
 				converters.Float64ToString(event.Y),
@@ -1202,7 +1202,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(event.Tick),
 				converters.IntToString(event.RoundNumber),
 				event.GrenadeID,
-				converters.Int64ToString(event.ProjectileID),
+				event.ProjectileID,
 				converters.Float64ToString(event.X),
 				converters.Float64ToString(event.Y),
 				converters.Float64ToString(event.Z),
@@ -1252,7 +1252,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(event.Tick),
 				converters.IntToString(event.RoundNumber),
 				event.GrenadeID,
-				converters.Int64ToString(event.ProjectileID),
+				event.ProjectileID,
 				converters.Float64ToString(event.X),
 				converters.Float64ToString(event.Y),
 				converters.Float64ToString(event.Z),
@@ -1302,7 +1302,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(event.Tick),
 				converters.IntToString(event.RoundNumber),
 				event.GrenadeID,
-				converters.Int64ToString(event.ProjectileID),
+				event.ProjectileID,
 				converters.Float64ToString(event.X),
 				converters.Float64ToString(event.Y),
 				converters.Float64ToString(event.Z),
@@ -1352,7 +1352,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(event.Tick),
 				converters.IntToString(event.RoundNumber),
 				event.GrenadeID,
-				converters.Int64ToString(event.ProjectileID),
+				event.ProjectileID,
 				converters.Float64ToString(event.X),
 				converters.Float64ToString(event.Y),
 				converters.Float64ToString(event.Z),
@@ -1407,7 +1407,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 				converters.IntToString(position.RoundNumber),
 				converters.Uint64ToString(position.ThrowerSteamID64),
 				position.ThrowerName,
-				converters.Int64ToString(position.UniqueID),
+				position.UniqueID,
 				converters.Float64ToString(position.X),
 				converters.Float64ToString(position.Y),
 				converters.Float64ToString(position.Z),
@@ -1450,6 +1450,34 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 		}
 
 		csv.WriteLinesIntoCsvFile(outputPath+"_chat_messages.csv", lines)
+	}
+
+	var writeCoaches = func() {
+		header := []string{
+			"steamid",
+			"user id",
+			"name",
+			"coaching side",
+			"team letter",
+			"first seen tick",
+			"match checksum",
+		}
+
+		lines := [][]string{header}
+		for _, coach := range match.Coaches {
+			line := []string{
+				converters.Uint64ToString(coach.SteamID64),
+				converters.IntToString(coach.UserID),
+				coach.Name,
+				converters.TeamToString(coach.CoachingSide),
+				string(coach.TeamLetter),
+				converters.IntToString(coach.FirstSeenTick),
+				match.Checksum,
+			}
+			lines = append(lines, line)
+		}
+
+		csv.WriteLinesIntoCsvFile(outputPath+"_coaches.csv", lines)
 	}
 
 	var writeHostagePositions = func() {
@@ -1613,6 +1641,7 @@ func exportMatchToCSV(match *Match, outputPath string) error {
 		writeDecoysStart,
 		writeInfernoPositions,
 		writeChatMessages,
+		writeCoaches,
 		writeHostagePositions,
 		writeHostagePickUpStart,
 		writeHostagePickedUp,
