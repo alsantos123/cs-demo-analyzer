@@ -27,6 +27,10 @@ const (
 	// Using the seconds from mp_buytime which is 20 seconds may leads to inaccurate results since during this timelapse
 	// players may have throw grenades, been killed...
 	equipmentValueDelaySeconds = 7
+	// Number of seconds positions keep being exported after the match ends (the last round's
+	// aftermath / win panel). Without it positions stop on the exact frame the match state
+	// flips, so 2D replays have no data to show the final round's end.
+	postMatchPositionsSeconds = 10
 )
 
 type Analyzer struct {
@@ -715,9 +719,24 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 	})
 
 	if includePositions {
+		matchWasStarted := false
+		matchEndTick := -1
 		parser.RegisterEventHandler(func(event events.FrameDone) {
-			if !analyzer.matchStarted() {
-				return
+			// Keep exporting for postMatchPositionsSeconds after the match state flips
+			// to "not started" (i.e. the match ended) so the last round has an aftermath.
+			if analyzer.matchStarted() {
+				matchWasStarted = true
+				matchEndTick = -1
+			} else {
+				if !matchWasStarted {
+					return
+				}
+				if matchEndTick == -1 {
+					matchEndTick = analyzer.currentTick()
+				}
+				if analyzer.secondsHasPassedSinceTick(postMatchPositionsSeconds, matchEndTick) {
+					return
+				}
 			}
 
 			for _, chickenEntity := range analyzer.chickenEntities {
@@ -1028,7 +1047,16 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 
 		grenadeProjectileDestroy := newGrenadeProjectileDestroyFromProjectile(analyzer, event.Projectile)
 		if grenadeProjectileDestroy != nil {
-			match.GrenadeProjectilesDestroy = append(match.GrenadeProjectilesDestroy, grenadeProjectileDestroy)
+			// The round-end cleanup of demoinfocs (clearGrenadeProjectiles) dispatches the destroy events of the
+			// remaining projectiles by ranging a map, so their order differs on every run. The destroys of a
+			// frame are kept sorted by projectile ID so that they are always exported in the same order.
+			destroys := match.GrenadeProjectilesDestroy
+			index := len(destroys)
+			for index > 0 && destroys[index-1].Frame == grenadeProjectileDestroy.Frame &&
+				destroys[index-1].projectileUniqueID > grenadeProjectileDestroy.projectileUniqueID {
+				index--
+			}
+			match.GrenadeProjectilesDestroy = slices.Insert(destroys, index, grenadeProjectileDestroy)
 		}
 	})
 

@@ -34,6 +34,7 @@ type PlayerPosition struct {
 	IsDefusing             bool                   `json:"isDefusing"`
 	IsPlanting             bool                   `json:"isPlanting"`
 	IsGrabbingHostage      bool                   `json:"isGrabbingHostage"`
+	LastPlaceName          string                 `json:"lastPlaceName"`
 	ActiveWeaponName       constants.WeaponName   `json:"activeWeaponName"`
 	Equipments             []constants.WeaponName `json:"equipments"`
 	Grenades               []constants.WeaponName `json:"grenades"`
@@ -109,6 +110,21 @@ func count(weapons []constants.WeaponName, weapon constants.WeaponName) int {
 	}
 
 	return n
+}
+
+// LastPlaceName() allocates a FRESH string per call (fmt.Sprint on the
+// sendtable property) and it's called ~10 players x ~170k frames per demo —
+// ~1.7M copies of ~30 distinct map-area names. Interning collapses that to
+// one allocation per distinct name. The demo parser runs its handlers on a
+// single goroutine, so a plain map is safe.
+var placeNameIntern = map[string]string{}
+
+func internPlaceName(s string) string {
+	if v, ok := placeNameIntern[s]; ok {
+		return v
+	}
+	placeNameIntern[s] = s
+	return s
 }
 
 func newPlayerPosition(analyzer *Analyzer, player *common.Player) *PlayerPosition {
@@ -195,6 +211,7 @@ func newPlayerPosition(analyzer *Analyzer, player *common.Player) *PlayerPositio
 		IsDefusing:             player.IsDefusing,
 		IsPlanting:             player.IsPlanting,
 		IsGrabbingHostage:      player.IsGrabbingHostage(),
+		LastPlaceName:          internPlaceName(player.LastPlaceName()),
 		ActiveWeaponName:       activeWeapon,
 		Equipments:             weapons.equipments,
 		Grenades:               weapons.grenades,

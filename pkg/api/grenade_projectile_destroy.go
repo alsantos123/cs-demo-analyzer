@@ -26,6 +26,8 @@ type GrenadeProjectileDestroy struct {
 	ThrowerVelocityZ float64              `json:"throwerVelocityZ"`
 	ThrowerPitch     float32              `json:"throwerPitch"`
 	ThrowerYaw       float32              `json:"throwerYaw"`
+	// ProjectileID as a number, used to sort the destroys of a frame (not exported).
+	projectileUniqueID common.UniqueID
 }
 
 func newGrenadeProjectileDestroyFromProjectile(analyzer *Analyzer, projectile *common.GrenadeProjectile) *GrenadeProjectileDestroy {
@@ -72,5 +74,7 @@ func newGrenadeProjectileDestroyFromProjectile(analyzer *Analyzer, projectile *c
 		ThrowerVelocityZ: velocity.Z,
 		ThrowerYaw:       thrower.ViewDirectionX(),
 		ThrowerPitch:     thrower.ViewDirectionY(),
+
+		projectileUniqueID: projectile.UniqueID(),
 	}
 }
