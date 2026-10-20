@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/common"
 	events "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/events"
 	st "github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/sendtables"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -90,6 +92,41 @@ func sortedEntityIDs[T any](scratch []int, entities map[int]T) []int {
 type AnalyzeDemoOptions struct {
 	IncludePositions bool
 	Source           constants.DemoSource
+}
+
+// parseToEnd is parser.ParseToEnd(), except that a demo cut inside the payload of an uncompressed frame
+// ends with ErrUnexpectedEndOfDemo, like a demo cut anywhere else, instead of a panic.
+// demoinfocs reads that last frame short (gobitread's ReadBytesInto stops at the end of the file without
+// an error) and panics on the proto.Unmarshal of the partial payload. GOTV demos whose recording was never
+// finalized end that way (HLTV 2399611 m2-dust2: 123 bytes short in its last DEM_Packet).
+// Only a protobuf error once the whole file has been read is turned into an error, anything else re-panics.
+func parseToEnd(parser dem.Parser, file *os.File) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+
+		if perr, ok := r.(error); ok && errors.Is(perr, proto.Error) && isFileFullyRead(file) {
+			err = fmt.Errorf("last frame truncated (%w): %w", perr, dem.ErrUnexpectedEndOfDemo)
+			return
+		}
+
+		panic(r)
+	}()
+
+	return parser.ParseToEnd()
+}
+
+func isFileFullyRead(file *os.File) bool {
+	position, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false
+	}
+
+	info, err := file.Stat()
+
+	return err == nil && position >= info.Size()
 }
 
 func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
@@ -215,7 +252,7 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 		return nil, errors.New("unknown demo source, please specify the source with the -source flag (UnknownSource)")
 	}
 
-	err = parser.ParseToEnd()
+	err = parseToEnd(parser, file)
 	// Do not stop if the demo is corrupted, usually the error occurs at the end of the parsing.
 	// Depending on how far we were able to parse the demo we may still have data.
 	isCorruptedDemo := errors.Is(err, dem.ErrUnexpectedEndOfDemo)
