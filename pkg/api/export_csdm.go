@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/akiver/cs-demo-analyzer/internal/csv"
 	"github.com/akiver/cs-demo-analyzer/internal/slice"
 	"github.com/akiver/cs-demo-analyzer/pkg/api/constants"
+	"github.com/golang/geo/r2"
 	"github.com/markus-wa/demoinfocs-golang/v4/pkg/demoinfocs/common"
 )
 
@@ -31,6 +33,98 @@ func joinSortedWeaponNames(weaponNames []constants.WeaponName) string {
 	sort.Strings(names)
 
 	return strings.Join(names, ",")
+}
+
+// Numbers and booleans of positions are packed as big-endian binary, it's the byte order used by PostgreSQL (int4send,
+// float4send) which makes the values easier to query in SQL.
+func appendInt32(bytes []byte, value int) []byte {
+	return binary.BigEndian.AppendUint32(bytes, uint32(value))
+}
+
+func appendFloat32(bytes []byte, value float32) []byte {
+	return binary.BigEndian.AppendUint32(bytes, math.Float32bits(value))
+}
+
+func appendBool(bytes []byte, value bool) []byte {
+	if value {
+		return append(bytes, 1)
+	}
+	return append(bytes, 0)
+}
+
+// PostgreSQL bytea hex format
+func toBytea(bytes []byte) string {
+	return "\\x" + hex.EncodeToString(bytes)
+}
+
+var textArrayEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+// PostgreSQL array literal, elements are quoted because they may contain commas.
+func toTextArray(values []string) string {
+	elements := make([]string, len(values))
+	for index, value := range values {
+		elements[index] = `"` + textArrayEscaper.Replace(value) + `"`
+	}
+	return "{" + strings.Join(elements, ",") + "}"
+}
+
+// Positions of an entity packed as big-endian binary.
+// A position is written only when it changes, entities such as smokes or chickens don't move most of the time.
+// The position of the last tick is always written so that it's possible to know when the entity disappeared.
+type packedPositions struct {
+	ticks         []byte
+	x             []byte
+	y             []byte
+	z             []byte
+	lastTick      int
+	lastX         float32
+	lastY         float32
+	lastZ         float32
+	isLastWritten bool
+}
+
+func (positions *packedPositions) write(tick int, x float32, y float32, z float32) {
+	positions.ticks = appendInt32(positions.ticks, tick)
+	positions.x = appendFloat32(positions.x, x)
+	positions.y = appendFloat32(positions.y, y)
+	positions.z = appendFloat32(positions.z, z)
+}
+
+func (positions *packedPositions) add(tick int, x float64, y float64, z float64) {
+	x32, y32, z32 := float32(x), float32(y), float32(z)
+	if len(positions.ticks) == 0 {
+		positions.write(tick, x32, y32, z32)
+		positions.isLastWritten = true
+	} else {
+		// Positions are sorted by frame and there may be multiple frames per tick.
+		if tick == positions.lastTick {
+			return
+		}
+
+		hasMoved := x32 != positions.lastX || y32 != positions.lastY || z32 != positions.lastZ
+		if hasMoved {
+			// The entity didn't move since the last written position, write the position of the previous tick so that
+			// the movement starts at the right tick.
+			if !positions.isLastWritten {
+				positions.write(positions.lastTick, positions.lastX, positions.lastY, positions.lastZ)
+			}
+			positions.write(tick, x32, y32, z32)
+		}
+		positions.isLastWritten = hasMoved
+	}
+
+	positions.lastTick = tick
+	positions.lastX = x32
+	positions.lastY = y32
+	positions.lastZ = z32
+}
+
+// Writes the position of the last tick if it hasn't been written yet.
+func (positions *packedPositions) finish() {
+	if !positions.isLastWritten {
+		positions.write(positions.lastTick, positions.lastX, positions.lastY, positions.lastZ)
+		positions.isLastWritten = true
+	}
 }
 
 func exportMatchForCSDM(match *Match, outputPath string) error {
@@ -173,8 +267,7 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 	// - the movement (position, yaw...) of each tick
 	// - the state (health, weapons...) only when it changes, stateTicks contains the tick of each change
 	// The first state of each player in a round is always written so that a round can be loaded independently.
-	// Numbers and booleans are packed as big-endian binary, it's the byte order used by PostgreSQL (int4send, float4send)
-	// which makes the values easier to query in SQL. Weapon names are PostgreSQL text arrays.
+	// Numbers and booleans are packed as big-endian binary and weapon names are PostgreSQL text arrays.
 	var writePlayerPositions = func() {
 		type playerRoundKey struct {
 			steamID     uint64
@@ -237,19 +330,6 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 			rifles                 []string
 			heavy                  []string
 		}
-		var appendInt32 = func(bytes []byte, value int) []byte {
-			return binary.BigEndian.AppendUint32(bytes, uint32(value))
-		}
-		var appendFloat32 = func(bytes []byte, value float32) []byte {
-			return binary.BigEndian.AppendUint32(bytes, math.Float32bits(value))
-		}
-		var appendBool = func(bytes []byte, value bool) []byte {
-			if value {
-				return append(bytes, 1)
-			}
-			return append(bytes, 0)
-		}
-
 		positionsPerPlayer := make(map[playerRoundKey]*playerRoundPositions)
 		var orderedPositions []*playerRoundPositions
 		for _, position := range match.PlayerPositions {
@@ -337,20 +417,6 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 			positions.smgs = append(positions.smgs, state.smgs)
 			positions.rifles = append(positions.rifles, state.rifles)
 			positions.heavy = append(positions.heavy, state.heavy)
-		}
-
-		// PostgreSQL bytea hex format
-		var toBytea = func(bytes []byte) string {
-			return "\\x" + hex.EncodeToString(bytes)
-		}
-		// PostgreSQL array literal, elements are quoted because weapon lists contain commas.
-		var toTextArray = func(values []string) string {
-			escaper := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
-			elements := make([]string, len(values))
-			for index, value := range values {
-				elements[index] = `"` + escaper.Replace(value) + `"`
-			}
-			return "{" + strings.Join(elements, ",") + "}"
 		}
 
 		lines := [][]string{}
@@ -530,16 +596,42 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 		csv.WriteLinesIntoCsvFile(outputPath+"_chicken_deaths.csv", lines)
 	}
 
+	// Chickens positions, 1 row per chicken and round, see packedPositions.
 	var writeChickenPositions = func() {
-		lines := [][]string{}
+		type chickenRoundKey struct {
+			chickenID   int
+			roundNumber int
+		}
+		type chickenRoundPositions struct {
+			roundNumber int
+			positions   packedPositions
+		}
+
+		positionsPerChicken := make(map[chickenRoundKey]*chickenRoundPositions)
+		var orderedPositions []*chickenRoundPositions
 		for _, position := range match.ChickenPositions {
+			key := chickenRoundKey{
+				chickenID:   position.chickenID,
+				roundNumber: position.RoundNumber,
+			}
+			chicken, exists := positionsPerChicken[key]
+			if !exists {
+				chicken = &chickenRoundPositions{roundNumber: position.RoundNumber}
+				positionsPerChicken[key] = chicken
+				orderedPositions = append(orderedPositions, chicken)
+			}
+			chicken.positions.add(position.Tick, position.X, position.Y, position.Z)
+		}
+
+		lines := [][]string{}
+		for _, chicken := range orderedPositions {
+			chicken.positions.finish()
 			line := []string{
-				converters.IntToString(position.Frame),
-				converters.IntToString(position.Tick),
-				converters.IntToString(position.RoundNumber),
-				converters.Float64ToString(position.X),
-				converters.Float64ToString(position.Y),
-				converters.Float64ToString(position.Z),
+				converters.IntToString(chicken.roundNumber),
+				toBytea(chicken.positions.ticks),
+				toBytea(chicken.positions.x),
+				toBytea(chicken.positions.y),
+				toBytea(chicken.positions.z),
 				match.Checksum,
 			}
 			lines = append(lines, line)
@@ -792,28 +884,48 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 		csv.WriteLinesIntoCsvFile(outputPath+"_players_buy.csv", lines)
 	}
 
+	// Grenades positions, 1 row per projectile, see packedPositions.
+	// Thrower values are the ones at the time of the throw.
 	var writeGrenadePositions = func() {
-		lines := [][]string{}
+		type projectilePositions struct {
+			first     *GrenadePosition
+			positions packedPositions
+		}
+
+		positionsPerProjectile := make(map[string]*projectilePositions)
+		var orderedPositions []*projectilePositions
 		for _, position := range match.GrenadePositions {
+			projectile, exists := positionsPerProjectile[position.ProjectileID]
+			if !exists {
+				projectile = &projectilePositions{first: position}
+				positionsPerProjectile[position.ProjectileID] = projectile
+				orderedPositions = append(orderedPositions, projectile)
+			}
+			projectile.positions.add(position.Tick, position.X, position.Y, position.Z)
+		}
+
+		lines := [][]string{}
+		for _, projectile := range orderedPositions {
+			projectile.positions.finish()
+			first := projectile.first
 			line := []string{
-				converters.IntToString(position.Frame),
-				converters.IntToString(position.Tick),
-				converters.IntToString(position.RoundNumber),
-				position.GrenadeID,
-				position.ProjectileID,
-				position.GrenadeName.String(),
-				converters.Float64ToString(position.X),
-				converters.Float64ToString(position.Y),
-				converters.Float64ToString(position.Z),
-				converters.Uint64ToString(position.ThrowerSteamID64),
-				position.ThrowerName,
-				converters.TeamToString(position.ThrowerSide),
-				position.ThrowerTeamName,
-				converters.Float64ToString(position.ThrowerVelocityX),
-				converters.Float64ToString(position.ThrowerVelocityY),
-				converters.Float64ToString(position.ThrowerVelocityZ),
-				converters.Float32ToString(position.ThrowerYaw),
-				converters.Float32ToString(position.ThrowerPitch),
+				converters.IntToString(first.RoundNumber),
+				first.GrenadeID,
+				first.ProjectileID,
+				first.GrenadeName.String(),
+				converters.Uint64ToString(first.ThrowerSteamID64),
+				first.ThrowerName,
+				converters.TeamToString(first.ThrowerSide),
+				first.ThrowerTeamName,
+				converters.Float64ToString(first.ThrowerVelocityX),
+				converters.Float64ToString(first.ThrowerVelocityY),
+				converters.Float64ToString(first.ThrowerVelocityZ),
+				converters.Float32ToString(first.ThrowerYaw),
+				converters.Float32ToString(first.ThrowerPitch),
+				toBytea(projectile.positions.ticks),
+				toBytea(projectile.positions.x),
+				toBytea(projectile.positions.y),
+				toBytea(projectile.positions.z),
 				match.Checksum,
 			}
 			lines = append(lines, line)
@@ -998,31 +1110,76 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 		csv.WriteLinesIntoCsvFile(outputPath+"_decoys_start.csv", lines)
 	}
 
+	// Infernos positions, 1 row per inferno. The position and the thrower of an inferno never change, only its 2D convex
+	// hull changes when fires ignite or extinguish.
+	// A convex hull is written only when it changes with its tick packed as big-endian binary, the convex hull of the
+	// last tick is always written so that it's possible to know when the inferno disappeared.
+	// A convex hull is a list of points "x1,y1,x2,y2...", it's empty when the inferno has no active fires.
 	var writeInfernoPositions = func() {
-		lines := [][]string{}
-		for _, position := range match.InfernoPositions {
-			var convexHull2D string
-			for index, point := range position.ConvexHull2D {
-				startCharacter := ""
+		type infernoHulls struct {
+			first         *InfernoPosition
+			ticks         []byte
+			hulls         []string
+			lastTick      int
+			lastHull      []r2.Point
+			isLastWritten bool
+		}
+		var formatHull = func(hull []r2.Point) string {
+			var builder strings.Builder
+			for index, point := range hull {
 				if index > 0 {
-					startCharacter = ","
+					builder.WriteString(",")
 				}
-				convexHull2D += fmt.Sprintf("%s%f,%f", startCharacter, point.X, point.Y)
+				fmt.Fprintf(&builder, "%f,%f", point.X, point.Y)
 			}
-			if convexHull2D == "" {
-				convexHull2D = "0,0"
+			return builder.String()
+		}
+		var writeHull = func(inferno *infernoHulls, tick int, hull []r2.Point) {
+			inferno.ticks = appendInt32(inferno.ticks, tick)
+			inferno.hulls = append(inferno.hulls, formatHull(hull))
+		}
+
+		hullsPerInferno := make(map[string]*infernoHulls)
+		var orderedHulls []*infernoHulls
+		for _, position := range match.InfernoPositions {
+			inferno, exists := hullsPerInferno[position.UniqueID]
+			if !exists {
+				inferno = &infernoHulls{first: position}
+				hullsPerInferno[position.UniqueID] = inferno
+				orderedHulls = append(orderedHulls, inferno)
+				writeHull(inferno, position.Tick, position.ConvexHull2D)
+				inferno.isLastWritten = true
+			} else {
+				// Positions are sorted by frame and there may be multiple frames per tick.
+				if position.Tick == inferno.lastTick {
+					continue
+				}
+				hasChanged := !slices.Equal(position.ConvexHull2D, inferno.lastHull)
+				if hasChanged {
+					writeHull(inferno, position.Tick, position.ConvexHull2D)
+				}
+				inferno.isLastWritten = hasChanged
 			}
+			inferno.lastTick = position.Tick
+			inferno.lastHull = position.ConvexHull2D
+		}
+
+		lines := [][]string{}
+		for _, inferno := range orderedHulls {
+			if !inferno.isLastWritten {
+				writeHull(inferno, inferno.lastTick, inferno.lastHull)
+			}
+			first := inferno.first
 			line := []string{
-				converters.IntToString(position.Frame),
-				converters.IntToString(position.Tick),
-				converters.IntToString(position.RoundNumber),
-				converters.Uint64ToString(position.ThrowerSteamID64),
-				position.ThrowerName,
-				position.UniqueID,
-				converters.Float64ToString(position.X),
-				converters.Float64ToString(position.Y),
-				converters.Float64ToString(position.Z),
-				convexHull2D,
+				converters.IntToString(first.RoundNumber),
+				first.UniqueID,
+				converters.Uint64ToString(first.ThrowerSteamID64),
+				first.ThrowerName,
+				converters.Float64ToString(first.X),
+				converters.Float64ToString(first.Y),
+				converters.Float64ToString(first.Z),
+				toBytea(inferno.ticks),
+				toTextArray(inferno.hulls),
 				match.Checksum,
 			}
 			lines = append(lines, line)
@@ -1051,17 +1208,61 @@ func exportMatchForCSDM(match *Match, outputPath string) error {
 		csv.WriteLinesIntoCsvFile(outputPath+"_chat_messages.csv", lines)
 	}
 
+	// Hostages positions, 1 row per hostage and round, see packedPositions.
+	// The state of a hostage is written only when it changes, stateTicks contains the tick of each change.
 	var writeHostagePositions = func() {
-		lines := [][]string{}
+		type hostageRoundKey struct {
+			entityID    int
+			serialNum   int
+			roundNumber int
+		}
+		type hostageRoundPositions struct {
+			roundNumber int
+			positions   packedPositions
+			stateTicks  []byte
+			states      []byte
+			lastTick    int
+			lastState   common.HostageState
+		}
+
+		positionsPerHostage := make(map[hostageRoundKey]*hostageRoundPositions)
+		var orderedPositions []*hostageRoundPositions
 		for _, position := range match.HostagePositions {
+			key := hostageRoundKey{
+				entityID:    position.entityID,
+				serialNum:   position.serialNum,
+				roundNumber: position.RoundNumber,
+			}
+			hostage, exists := positionsPerHostage[key]
+			if !exists {
+				hostage = &hostageRoundPositions{roundNumber: position.RoundNumber}
+				positionsPerHostage[key] = hostage
+				orderedPositions = append(orderedPositions, hostage)
+			}
+			hostage.positions.add(position.Tick, position.X, position.Y, position.Z)
+			// Like positions, only the first frame of a tick is used.
+			if exists && position.Tick == hostage.lastTick {
+				continue
+			}
+			hostage.lastTick = position.Tick
+			if !exists || position.State != hostage.lastState {
+				hostage.stateTicks = appendInt32(hostage.stateTicks, position.Tick)
+				hostage.states = appendInt32(hostage.states, int(position.State))
+				hostage.lastState = position.State
+			}
+		}
+
+		lines := [][]string{}
+		for _, hostage := range orderedPositions {
+			hostage.positions.finish()
 			line := []string{
-				converters.IntToString(position.Frame),
-				converters.IntToString(position.Tick),
-				converters.IntToString(position.RoundNumber),
-				converters.Float64ToString(position.X),
-				converters.Float64ToString(position.Y),
-				converters.Float64ToString(position.Z),
-				converters.ByteToString(byte(position.State)),
+				converters.IntToString(hostage.roundNumber),
+				toBytea(hostage.positions.ticks),
+				toBytea(hostage.positions.x),
+				toBytea(hostage.positions.y),
+				toBytea(hostage.positions.z),
+				toBytea(hostage.stateTicks),
+				toBytea(hostage.states),
 				match.Checksum,
 			}
 			lines = append(lines, line)
