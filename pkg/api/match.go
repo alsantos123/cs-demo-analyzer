@@ -69,12 +69,17 @@ type Match struct {
 	ChickenDeaths             []*ChickenDeath             `json:"chickenDeaths"`
 	Damages                   []*Damage                   `json:"damages"`
 	PlayerPositions           []*PlayerPosition           `json:"playerPositions"`
+	PlayerPositionSamples     []*PlayerPositionSample     `json:"playerPositionSamples"`
 	PlayersBuy                []*PlayerBuy                `json:"playersBuy"`
 	PlayerEconomies           []*PlayerEconomy            `json:"playerEconomies"`
 	ChatMessages              []*ChatMessage              `json:"chatMessages"`
 	Coaches                   []*Coach                    `json:"coaches"`
 	scoreTeamA                *int
 	scoreTeamB                *int
+	// Positions of the rounds that are over when they are spooled to disk during the analysis, nil otherwise.
+	positionsSpool *positionsSpool
+	// Entities whose position has been captured during the current tick, see tickPositions.
+	tickPositions tickPositions
 }
 
 type MatchAlias Match
@@ -191,8 +196,8 @@ func (match *Match) computeResultStats() {
 	// Listening on CCSTeam.m_scoreTotal or the event ScoreUpdated is not reliable with non Valve demos.
 	isFirstHalf := true
 	for roundIndex, round := range match.Rounds {
-		if match.FrameRate > 0 {
-			round.Duration = int64(((float64(round.EndFrame) - float64(round.StartFrame)) / match.FrameRate) * 1000)
+		if match.TickRate > 0 {
+			round.Duration = int64(((float64(round.EndTick) - float64(round.StartTick)) / match.TickRate) * 1000)
 		}
 
 		if round.WinnerSide == round.TeamASide {
@@ -308,6 +313,7 @@ func newMatch(source constants.DemoSource, demoInfo *demo.Demo) Match {
 		PlayersBuy:                []*PlayerBuy{},
 		PlayerEconomies:           []*PlayerEconomy{},
 		PlayerPositions:           []*PlayerPosition{},
+		PlayerPositionSamples:     []*PlayerPositionSample{},
 		GrenadePositions:          []*GrenadePosition{},
 		GrenadeBounces:            []*GrenadeBounce{},
 		InfernoPositions:          []*InfernoPosition{},
@@ -332,6 +338,10 @@ func newMatch(source constants.DemoSource, demoInfo *demo.Demo) Match {
 }
 
 func (match *Match) reset() {
+	if match.positionsSpool != nil {
+		match.positionsSpool.reset()
+	}
+	match.tickPositions.reset()
 	match.PlayersBySteamID = make(map[uint64]*Player)
 	match.Coaches = []*Coach{}
 	match.Rounds = []*Round{}
@@ -347,6 +357,7 @@ func (match *Match) reset() {
 	match.PlayersFlashed = []*PlayerFlashed{}
 	match.PlayersBuy = []*PlayerBuy{}
 	match.PlayerPositions = []*PlayerPosition{}
+	match.PlayerPositionSamples = []*PlayerPositionSample{}
 	match.GrenadePositions = []*GrenadePosition{}
 	match.GrenadeBounces = []*GrenadeBounce{}
 	match.InfernoPositions = []*InfernoPosition{}
@@ -366,6 +377,10 @@ func (match *Match) reset() {
 }
 
 func (match *Match) resetRound(roundNumber int) {
+	if match.positionsSpool != nil {
+		match.positionsSpool.deleteRound(roundNumber)
+	}
+	match.tickPositions.reset()
 	match.BombsPlantStart = slice.Filter(match.BombsPlantStart, func(event *BombPlantStart, index int) bool {
 		return event.RoundNumber != roundNumber
 	})
@@ -434,6 +449,9 @@ func (match *Match) resetRound(roundNumber int) {
 	})
 	match.PlayerPositions = slice.Filter(match.PlayerPositions, func(position *PlayerPosition, index int) bool {
 		return position.RoundNumber != roundNumber
+	})
+	match.PlayerPositionSamples = slice.Filter(match.PlayerPositionSamples, func(sample *PlayerPositionSample, index int) bool {
+		return sample.RoundNumber != roundNumber
 	})
 	match.PlayersBuy = slice.Filter(match.PlayersBuy, func(event *PlayerBuy, index int) bool {
 		return event.RoundNumber != roundNumber

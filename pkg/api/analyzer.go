@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -69,13 +70,17 @@ type Analyzer struct {
 	chickenCount int
 	// Cached 2D convex hull of each burning inferno's active fires, only used when positions are included.
 	infernoHulls map[common.UniqueID]*infernoHull
-	// Weapon lists of the last position created for each player, shared with the next positions while the
-	// inventory doesn't change, see internWeapons(). Only used when positions are included.
-	playerWeapons map[*common.Player]*playerWeapons
+	// Weapons of the last position created for each player, shared with the next positions while the
+	// inventory doesn't change, see internPlayerWeapons(). Only used when positions are included.
+	playerWeapons map[*common.Player]*PlayerWeapons
 	// Scratch lists newPlayerPosition() builds the current inventory into before comparing it with playerWeapons.
-	playerWeaponsScratch playerWeapons
+	playerWeaponsScratch PlayerWeapons
 	// Scratch slice for sortedEntityIDs(), re-used across frames.
 	entityIDsScratch []int
+	// Second of the round of the last position samples, see samplePlayerPositions().
+	lastPositionSampleSecond positionSampleSecond
+	// Rounded tick rate used to split rounds into seconds, updated when the tick rate is available.
+	ticksPerSecond int
 }
 
 // sortedEntityIDs returns the keys of a map of entities by entity ID in ascending order, to range over the map in a
@@ -89,6 +94,16 @@ func sortedEntityIDs[T any](scratch []int, entities map[int]T) []int {
 	slices.Sort(ids)
 
 	return ids
+}
+
+// ticksPerSecondFromTickRate returns the number of ticks in a second, 64 when the tick rate is unknown.
+func ticksPerSecondFromTickRate(tickRate float64) int {
+	ticksPerSecond := int(math.Round(tickRate))
+	if ticksPerSecond <= 0 {
+		return 64
+	}
+
+	return ticksPerSecond
 }
 
 type AnalyzeDemoOptions struct {
@@ -131,7 +146,9 @@ func isFileFullyRead(file *os.File) bool {
 	return err == nil && position >= info.Size()
 }
 
-func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
+// spoolPositions stores the positions of the rounds that are over in a temporary file instead of keeping them in
+// memory, the returned match must be closed with closePositionsSpool() once exported.
+func analyzeDemo(demoPath string, options AnalyzeDemoOptions, spoolPositions bool) (*Match, error) {
 	if options.Source != "" {
 		err := ValidateDemoSource(options.Source)
 		if err != nil {
@@ -189,23 +206,23 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 		lastFreezeTimeEndTick:     -1,
 		bombPlantPosition:         r3.Vector{},
 		infernoHulls:              map[common.UniqueID]*infernoHull{},
-		playerWeapons:             map[*common.Player]*playerWeapons{},
+		playerWeapons:             map[*common.Player]*PlayerWeapons{},
+		lastPositionSampleSecond:  noPositionSampleSecond,
+		ticksPerSecond:            ticksPerSecondFromTickRate(match.TickRate),
 		lastGrenadeThrownByPlayer: make(map[uint64]*Shot),
 		playersUntyingAnHostage:   make(map[uint64]int),
 		postProcess:               defaultPostProcess,
 	}
 
 	analyzer.currentRound = &Round{
-		analyzer:           analyzer,
-		Number:             1,
-		StartTick:          1,
-		StartFrame:         1,
-		FreezeTimeEndFrame: -1,
-		FreezeTimeEndTick:  -1,
-		TeamAName:          match.TeamA.Name,
-		TeamBName:          match.TeamB.Name,
-		TeamASide:          *match.TeamA.CurrentSide,
-		TeamBSide:          *match.TeamB.CurrentSide,
+		analyzer:          analyzer,
+		Number:            1,
+		StartTick:         1,
+		FreezeTimeEndTick: -1,
+		TeamAName:         match.TeamA.Name,
+		TeamBName:         match.TeamB.Name,
+		TeamASide:         *match.TeamA.CurrentSide,
+		TeamBSide:         *match.TeamB.CurrentSide,
 	}
 
 	analyzer.registerCommonHandlers(options.IncludePositions)
@@ -254,11 +271,22 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 		return nil, errors.New("unknown demo source, please specify the source with the -source flag (UnknownSource)")
 	}
 
+	if spoolPositions && options.IncludePositions {
+		spool, err := newPositionsSpool()
+		if err != nil {
+			// Fall back to keeping all the positions in memory
+			fmt.Fprintf(os.Stderr, "%v, positions will be kept in memory\n", err)
+		} else {
+			match.positionsSpool = spool
+		}
+	}
+
 	err = parseToEnd(parser, file)
 	// Do not stop if the demo is corrupted, usually the error occurs at the end of the parsing.
 	// Depending on how far we were able to parse the demo we may still have data.
 	isCorruptedDemo := errors.Is(err, dem.ErrUnexpectedEndOfDemo)
 	if err != nil && !isCorruptedDemo {
+		match.closePositionsSpool()
 		return nil, err
 	}
 
@@ -285,6 +313,11 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 	}
 
 	analyzer.postProcess(analyzer)
+	analyzer.spillPositions()
+	if spool := match.positionsSpool; spool != nil && spool.err != nil {
+		match.closePositionsSpool()
+		return nil, spool.err
+	}
 	match.deleteIncompleteRounds()
 	match.computeResultStats()
 
@@ -292,7 +325,7 @@ func analyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
 }
 
 func AnalyzeDemo(demoPath string, options AnalyzeDemoOptions) (*Match, error) {
-	match, err := analyzeDemo(demoPath, options)
+	match, err := analyzeDemo(demoPath, options, false)
 
 	return match, err
 }
@@ -313,14 +346,17 @@ func AnalyzeAndExportDemo(demoPath string, outputPath string, options AnalyzeAnd
 		}
 	}
 
+	// The positions of the rounds that are over are spooled to disk rather than kept in memory, the exporters read
+	// them back a round at a time.
 	match, err := analyzeDemo(demoPath, AnalyzeDemoOptions{
 		IncludePositions: options.IncludePositions,
 		Source:           options.Source,
-	})
+	}, true)
 
 	if err != nil {
 		return err
 	}
+	defer match.closePositionsSpool()
 
 	switch options.Format {
 	case "csv":
@@ -344,6 +380,7 @@ func (analyzer *Analyzer) reset() {
 	analyzer.lastFreezeTimeEndTick = -1
 	analyzer.lastGrenadeThrownByPlayer = make(map[uint64]*Shot)
 	analyzer.playersUntyingAnHostage = make(map[uint64]int)
+	analyzer.lastPositionSampleSecond = noPositionSampleSecond
 	analyzer.chickenEntities = nil
 	analyzer.clutch1 = nil
 	analyzer.clutch2 = nil
@@ -357,8 +394,6 @@ func (analyzer *Analyzer) reset() {
 		analyzer:               analyzer,
 		Number:                 1,
 		StartTick:              1,
-		StartFrame:             1,
-		FreezeTimeEndFrame:     -1,
 		FreezeTimeEndTick:      -1,
 		TeamASide:              *analyzer.match.TeamA.CurrentSide,
 		TeamBSide:              *analyzer.match.TeamB.CurrentSide,
@@ -445,11 +480,44 @@ func (analyzer *Analyzer) registerUnknownPlayers() {
 	}
 }
 
+// teamNameFromState returns the name of the team currently playing the given side.
+//
+// Since clan tags have been re-introduced in CS2, the real team name is carried by the players' clan tag (m_szClan)
+// rather than by the team entity's clan name (m_szClanTeamname).
+// The clan tag shared by more than half of the team's players is used so a single player with a personal clan tag
+// doesn't rename the whole team.
+// When no such clan tag exists (older CS2 demos, players without clan tag), it falls back to the team entity's clan name.
+func (analyzer *Analyzer) teamNameFromState(team *common.TeamState) string {
+	if !analyzer.isSource2 {
+		return team.ClanName()
+	}
+
+	members := team.Members()
+	countPerClanTag := make(map[string]int)
+	mostSharedClanTag := ""
+	for _, member := range members {
+		clanTag := member.ClanTag()
+		if clanTag == "" {
+			continue
+		}
+		countPerClanTag[clanTag]++
+		if countPerClanTag[clanTag] > countPerClanTag[mostSharedClanTag] {
+			mostSharedClanTag = clanTag
+		}
+	}
+
+	if mostSharedClanTag != "" && countPerClanTag[mostSharedClanTag]*2 > len(members) {
+		return mostSharedClanTag
+	}
+
+	return team.ClanName()
+}
+
 func (analyzer *Analyzer) updateTeamNames() {
 	gameState := analyzer.parser.GameState()
 	match := analyzer.match
-	teamNameA := strings.ReplaceUTF8ByteSequences(gameState.Team(*match.TeamA.CurrentSide).ClanName())
-	teamNameB := strings.ReplaceUTF8ByteSequences(gameState.Team(*match.TeamB.CurrentSide).ClanName())
+	teamNameA := strings.ReplaceUTF8ByteSequences(analyzer.teamNameFromState(gameState.Team(*match.TeamA.CurrentSide)))
+	teamNameB := strings.ReplaceUTF8ByteSequences(analyzer.teamNameFromState(gameState.Team(*match.TeamB.CurrentSide)))
 	if teamNameA == teamNameB {
 		return
 	}
@@ -504,13 +572,11 @@ func (analyzer *Analyzer) updatePlayersCurrentTeam() {
 }
 
 func (analyzer *Analyzer) processMatchStart() {
-	parser := analyzer.parser
 	match := analyzer.match
 	match.resetRound(1)
 	analyzer.updatePlayersCurrentTeam()
 
 	currentRound := analyzer.currentRound
-	currentRound.StartFrame = parser.CurrentFrame()
 	currentRound.StartTick = analyzer.currentTick()
 	currentRound.TeamASide = *match.TeamA.CurrentSide
 	currentRound.TeamBSide = *match.TeamB.CurrentSide
@@ -520,6 +586,7 @@ func (analyzer *Analyzer) processMatchStart() {
 
 // This creates a Round, reset analyzer data related to the current round and set the new round as the current round.
 func (analyzer *Analyzer) createRound() {
+	analyzer.spillPositions()
 	analyzer.clutch1 = nil
 	analyzer.clutch2 = nil
 	analyzer.lastGrenadeThrownByPlayer = make(map[uint64]*Shot)
@@ -555,12 +622,7 @@ func (analyzer *Analyzer) handleRoundEnd(winnerTeam common.Team) {
 	analyzer.currentRound.WinnerSide = *analyzer.match.Team(winnerTeam).CurrentSide
 	analyzer.currentRound.EndTick = analyzer.currentTick()
 	analyzer.currentRound.EndOfficiallyTick = analyzer.currentTick()
-	analyzer.currentRound.EndFrame = analyzer.parser.CurrentFrame()
-	analyzer.currentRound.EndOfficiallyFrame = analyzer.parser.CurrentFrame()
 
-	if analyzer.currentRound.FreezeTimeEndFrame == -1 {
-		analyzer.currentRound.FreezeTimeEndFrame = analyzer.parser.CurrentFrame()
-	}
 	if analyzer.currentRound.FreezeTimeEndTick == -1 {
 		analyzer.currentRound.FreezeTimeEndTick = analyzer.currentTick()
 	}
@@ -631,7 +693,6 @@ func (analyzer *Analyzer) defaultRoundFreezetimeChangedHandler(event events.Roun
 		analyzer.createPlayersEconomies()
 	} else {
 		analyzer.currentRound.FreezeTimeEndTick = analyzer.currentTick()
-		analyzer.currentRound.FreezeTimeEndFrame = analyzer.parser.CurrentFrame()
 		analyzer.lastFreezeTimeEndTick = analyzer.currentTick()
 	}
 }
@@ -654,6 +715,7 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 
 	parser.RegisterEventHandler(func(event events.TickRateInfoAvailable) {
 		match.TickRate = parser.TickRate()
+		analyzer.ticksPerSecond = ticksPerSecondFromTickRate(match.TickRate)
 	})
 
 	parser.RegisterEventHandler(func(event events.POVRecordingPlayerDetected) {
@@ -667,6 +729,17 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 	parser.RegisterEventHandler(func(event events.RoundStart) {
 		analyzer.registerUnknownPlayers()
 	})
+
+	if analyzer.isSource2 {
+		parser.RegisterEventHandler(func(events.DataTablesParsed) {
+			// CS2 team names are based on players' clan tag, keep them in sync when a player's clan tag changes.
+			parser.ServerClasses().FindByName("CCSPlayerController").OnEntityCreated(func(entity st.Entity) {
+				entity.Property("m_szClan").OnUpdate(func(value st.PropertyValue) {
+					analyzer.updateTeamNames()
+				})
+			})
+		})
+	}
 
 	parser.RegisterEventHandler(func(event events.ConVarsUpdated) {
 		for varName, varValue := range event.UpdatedConVars {
@@ -697,7 +770,7 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 			return
 		}
 
-		chickenDeath := newChickenDeath(analyzer.parser.CurrentFrame(), analyzer.currentTick(), analyzer.currentRound.Number, event.Killer.SteamID64, equipmentToWeaponName[event.Weapon.Type])
+		chickenDeath := newChickenDeath(analyzer.currentTick(), analyzer.currentRound.Number, event.Killer.SteamID64, equipmentToWeaponName[event.Weapon.Type])
 		analyzer.match.ChickenDeaths = append(analyzer.match.ChickenDeaths, chickenDeath)
 	})
 
@@ -755,6 +828,8 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 			analyzer.currentRound.computeTeamsEconomy()
 			analyzer.lastFreezeTimeEndTick = -1
 		}
+
+		analyzer.samplePlayerPositions()
 	})
 
 	if includePositions {
@@ -778,9 +853,17 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 				}
 			}
 
+			// Several frames may have the same tick, only the first position of an entity is captured for a tick.
+			captured := &match.tickPositions
+			captured.startFrame(analyzer.currentTick(), analyzer.currentRound.Number)
+
 			for _, chicken := range analyzer.chickenEntities {
+				if hasPosition(captured, captured.chickens, chicken) {
+					continue
+				}
 				chickenPosition := newChickenPositionFromEntity(analyzer, chicken)
 				match.ChickenPositions = append(match.ChickenPositions, chickenPosition)
+				captured.chickens = append(captured.chickens, chicken)
 			}
 
 			// GrenadeProjectiles() and Infernos() are maps, ranging them yields a different order on every run.
@@ -788,29 +871,53 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 			projectiles := parser.GameState().GrenadeProjectiles()
 			analyzer.entityIDsScratch = sortedEntityIDs(analyzer.entityIDsScratch, projectiles)
 			for _, entityID := range analyzer.entityIDsScratch {
-				position := newGrenadePositionFromProjectile(analyzer, projectiles[entityID])
+				projectile := projectiles[entityID]
+				if hasPosition(captured, captured.projectiles, projectile) {
+					continue
+				}
+				position := newGrenadePositionFromProjectile(analyzer, projectile)
 				if position != nil {
 					match.GrenadePositions = append(match.GrenadePositions, position)
+					captured.projectiles = append(captured.projectiles, projectile)
 				}
 			}
 
 			infernos := parser.GameState().Infernos()
 			analyzer.entityIDsScratch = sortedEntityIDs(analyzer.entityIDsScratch, infernos)
 			for _, entityID := range analyzer.entityIDsScratch {
-				infernoPosition := newInfernoPositionFromInferno(analyzer, infernos[entityID])
+				inferno := infernos[entityID]
+				if hasPosition(captured, captured.infernos, inferno) {
+					continue
+				}
+				infernoPosition := newInfernoPositionFromInferno(analyzer, inferno)
 				if infernoPosition != nil {
 					match.InfernoPositions = append(match.InfernoPositions, infernoPosition)
+					captured.infernos = append(captured.infernos, inferno)
 				}
 			}
 
 			for _, player := range parser.GameState().Participants().Playing() {
+				if hasPosition(captured, captured.players, player) {
+					continue
+				}
 				playerPosition := newPlayerPosition(analyzer, player)
 				match.PlayerPositions = append(match.PlayerPositions, playerPosition)
+				captured.players = append(captured.players, player)
 			}
 
 			for _, hostage := range parser.GameState().Hostages() {
+				if hasPosition(captured, captured.hostages, hostage) {
+					continue
+				}
 				hostagePosition := newHostagePositionFromHostage(analyzer, hostage)
 				match.HostagePositions = append(match.HostagePositions, hostagePosition)
+				captured.hostages = append(captured.hostages, hostage)
+			}
+
+			// A round is spooled once it's over but a very long one (practice demo, long warmup) would keep all its
+			// positions in memory, so it's spooled in parts to bound the memory whatever the demo.
+			if len(match.PlayerPositions)+len(match.GrenadePositions) >= maxPositionsInMemory {
+				analyzer.spillPositions()
 			}
 		})
 
@@ -852,7 +959,6 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 			return
 		}
 
-		analyzer.currentRound.EndOfficiallyFrame = parser.CurrentFrame()
 		analyzer.currentRound.EndOfficiallyTick = analyzer.currentTick()
 	})
 
@@ -1088,10 +1194,10 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 		if grenadeProjectileDestroy != nil {
 			// The round-end cleanup of demoinfocs (clearGrenadeProjectiles) dispatches the destroy events of the
 			// remaining projectiles by ranging a map, so their order differs on every run. The destroys of a
-			// frame are kept sorted by projectile ID so that they are always exported in the same order.
+			// tick are kept sorted by projectile ID so that they are always exported in the same order.
 			destroys := match.GrenadeProjectilesDestroy
 			index := len(destroys)
-			for index > 0 && destroys[index-1].Frame == grenadeProjectileDestroy.Frame &&
+			for index > 0 && destroys[index-1].Tick == grenadeProjectileDestroy.Tick &&
 				destroys[index-1].projectileUniqueID > grenadeProjectileDestroy.projectileUniqueID {
 				index--
 			}
@@ -1501,7 +1607,6 @@ func (analyzer *Analyzer) registerCommonHandlers(includePositions bool) {
 				currentTick := analyzer.currentTick()
 				if lastTimeoutUpdateTick != currentTick && val.Float() == 0 && !analyzer.isRoundEndDetected {
 					analyzer.currentRound.StartTick = currentTick
-					analyzer.currentRound.StartFrame = parser.CurrentFrame()
 				}
 				lastTimeoutUpdateTick = currentTick
 			}
@@ -1531,4 +1636,33 @@ func defaultPostProcess(analyzer *Analyzer) {
 	if len(match.Rounds) < currentRound.Number {
 		match.Rounds = append(match.Rounds, currentRound)
 	}
+}
+
+// maxPositionsInMemory is the number of positions above which the positions of the current round are spooled before
+// it's over. A regular round has up to ~100k player positions at 64 ticks per second and ~200k at 128.
+const maxPositionsInMemory = 250_000
+
+// spillPositions moves the positions of the current round to the positions spool when positions are spooled, see
+// positionsSpool. It's called when a round is over, and during a round that has too many positions, so that only
+// the positions of the current round are in memory.
+func (analyzer *Analyzer) spillPositions() {
+	match := analyzer.match
+	spool := match.positionsSpool
+	if spool == nil {
+		return
+	}
+
+	spool.writeRound(analyzer.currentRound.Number, match)
+
+	// The backing arrays are kept for the next round, cleared so that the spooled positions can be collected.
+	clear(match.PlayerPositions)
+	match.PlayerPositions = match.PlayerPositions[:0]
+	clear(match.GrenadePositions)
+	match.GrenadePositions = match.GrenadePositions[:0]
+	clear(match.InfernoPositions)
+	match.InfernoPositions = match.InfernoPositions[:0]
+	clear(match.ChickenPositions)
+	match.ChickenPositions = match.ChickenPositions[:0]
+	clear(match.HostagePositions)
+	match.HostagePositions = match.HostagePositions[:0]
 }
